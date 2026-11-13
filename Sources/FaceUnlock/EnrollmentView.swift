@@ -11,6 +11,7 @@ struct EnrollmentView: View {
     let save: () -> Void
     let useGuidedSamples: () -> Void
     @State private var confirmGuided = false
+    var recognitionDeveloperDiagnostics = CommandLine.arguments.contains("--recognition-diagnostics")
     var developerDiagnostics = CommandLine.arguments.contains("--enrollment-diagnostics")
 
     var body: some View {
@@ -24,7 +25,10 @@ struct EnrollmentView: View {
                         .frame(maxWidth: .infinity).frame(height: 220)
                         .background(.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .accessibilityLabel("Live camera preview")
+                        .accessibilityLabel(camera.completed ? "Camera stopped" : "Live camera preview")
+                        .overlay {
+                            if camera.completed { Text("Camera stopped").padding(8).background(.black.opacity(0.8)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 6)) }
+                        }
                     if mode == .enroll, let diagnostics = camera.diagnostics {
                         ProgressView(value: Double(diagnostics.accepted), total: 6) {
                             wrapped("\(diagnostics.accepted) of 6 samples · \(diagnostics.stage)")
@@ -32,6 +36,14 @@ struct EnrollmentView: View {
                         if diagnostics.poseMode == .guided {
                             wrapped("Guided samples: head turns are NOT validated.")
                                 .font(.subheadline.weight(.medium)).foregroundStyle(.orange)
+                        }
+                    }
+                    if mode == .verify {
+                        wrapped("Identity acceptance disabled: confirmed false acceptance is under investigation.")
+                            .font(.subheadline.weight(.medium)).foregroundStyle(.orange)
+                        if camera.completed {
+                            wrapped("Completed attempt — camera is off. This result does not apply to a new person. Retry starts a new comparison.")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     wrapped(manager.busy ? "Accessing local Keychain…" : camera.message)
@@ -51,6 +63,13 @@ struct EnrollmentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     wrapped("Processing stays local. Only the saved enrollment embedding is kept in Keychain. Closing stops the camera.")
                         .font(.caption).foregroundStyle(.secondary)
+                    if recognitionDeveloperDiagnostics && mode == .verify {
+                        DisclosureGroup("Recognition diagnostics — not identity probabilities") {
+                            if let diagnostics = camera.recognitionDiagnostics {
+                                RecognitionDiagnosticsView(diagnostics: diagnostics, captureActive: camera.isStreaming)
+                            } else { wrapped("No frame evaluated in this attempt. Prior scores are cleared on Retry.") }
+                        }.font(.caption)
+                    }
                     if developerDiagnostics && mode == .enroll {
                         DisclosureGroup("Developer diagnostics — transient, not logged") {
                             diagnosticDetails

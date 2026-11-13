@@ -21,7 +21,7 @@ struct MenuBarView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text(enrollment.status).font(.caption)
-                Text("Prototype face matching. No reliable anti-spoofing. Does not unlock your Mac.")
+                Text("Identity acceptance disabled after false acceptance. Diagnostic comparison only. Does not unlock your Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

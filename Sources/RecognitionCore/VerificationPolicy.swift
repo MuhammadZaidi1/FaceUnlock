@@ -25,13 +25,19 @@ public struct VerificationAccumulator {
     public let policy: VerificationPolicy
     private var lastTime: TimeInterval = -.infinity
     private var count = 0
-    private var streak = 0
+    public private(set) var streak = 0
     private var result: VerificationDecision = .checking
     public init(policy: VerificationPolicy = .sface) { self.policy = policy }
     public mutating func resetStreak() { streak = 0 }
     public mutating func observe(score: Double, timestamp: TimeInterval) -> VerificationDecision {
         guard result == .checking else { return result }
-        guard timestamp.isFinite, timestamp - lastTime >= policy.minimumFrameInterval else { return .checking }
+        guard timestamp.isFinite, timestamp > lastTime else {
+            streak = 0
+            return .checking
+        }
+        guard timestamp - lastTime >= policy.minimumFrameInterval else { return .checking }
+        // A long interruption is not a consecutive sequence of live comparisons.
+        if timestamp - lastTime > 2 { streak = 0 }
         lastTime = timestamp
         count += 1
         streak = policy.accepts(score) ? streak + 1 : 0

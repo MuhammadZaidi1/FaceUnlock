@@ -44,6 +44,18 @@ struct EnrollmentLayoutTests {
             window.close()
         }
     }
+    @Test @MainActor func recognitionDiagnosticsWrapAtMinimumWidth() {
+        let d = RecognitionDiagnostics(score: 0.5, threshold: 0.363, passedThreshold: true, streak: 3,
+            evaluatedFrames: 3, freshFrame: true, frameTimestamp: 12.5,
+            rejection: nil, model: .sface)
+        let root = RecognitionDiagnosticsView(diagnostics: d, captureActive: false)
+            .padding(18).frame(width: 420)
+        let host = NSHostingView(rootView: root)
+        host.frame = NSRect(x: 0, y: 0, width: 420, height: 520)
+        host.layoutSubtreeIfNeeded()
+        #expect(host.fittingSize.width <= 420)
+    }
+
 }
 
 private struct EmptyLayoutStore: EnrollmentStore {

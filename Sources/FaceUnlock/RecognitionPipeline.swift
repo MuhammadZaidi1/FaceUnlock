@@ -9,6 +9,7 @@ struct RecognitionFrameResult {
     var candidate: EnrollmentProfile?
     var diagnostics: EnrollmentDiagnostics?
     var rejection: String?
+    var recognitionDiagnostics: RecognitionDiagnostics?
 }
 
 enum RecognitionMode { case enroll, verify }
@@ -25,6 +26,13 @@ final class RecognitionPipeline {
     private var didInvokeModel = false
     private var processedFrames = 0
     private var poseRejections = 0
+    private var freshFrames = FreshFrameGate()
+    private var lastFrameTime: TimeInterval?
+    private var currentScore: Double?
+    private var freshFrame = false
+    private var currentFrameTimestamp: TimeInterval?
+    private var evaluatedFrames = 0
+    private var terminalResult: RecognitionFrameResult?
     private var lastSample = -Double.infinity
 
     init(mode: RecognitionMode, profile: EnrollmentProfile?, model: FaceEmbeddingModel = SFaceModel(), poseMode: EnrollmentPoseMode = .validated) {
@@ -37,12 +45,34 @@ final class RecognitionPipeline {
     func prepare() throws { try model.prepare() }
     func interrupt() { verification.resetStreak() }
 
-    func process(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval, detectorPose: FacePose? = nil) -> RecognitionFrameResult {
+    func process(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval, detectorPose: FacePose? = nil, frameTimestamp: TimeInterval? = nil) -> RecognitionFrameResult {
+        if var terminal = terminalResult {
+            terminal.recognitionDiagnostics?.freshFrame = false
+            terminal.recognitionDiagnostics?.score = nil
+            terminal.recognitionDiagnostics?.passedThreshold = nil
+            return terminal
+        }
         didInvokeModel = false
+        currentScore = nil
+        currentFrameTimestamp = frameTimestamp ?? timestamp
+        freshFrame = freshFrames.accept(frameTimestamp ?? timestamp)
         processedFrames += 1
         let face = faces.count == 1 ? faces.first : nil
         let pose = detectorPose ?? FacePose(yaw: face?.yaw?.doubleValue, pitch: face?.pitch?.doubleValue, roll: face?.roll?.doubleValue)
-        var result = processFrame(buffer, faces: faces, quality: quality, timestamp: timestamp, pose: pose)
+        var result: RecognitionFrameResult
+        if !freshFrame {
+            result = reject("Waiting for a fresh camera frame; repeated or out-of-order frame rejected.")
+        } else {
+            if let lastFrameTime, timestamp - lastFrameTime > 2 { verification.resetStreak() }
+            lastFrameTime = timestamp
+            result = processFrame(buffer, faces: faces, quality: quality, timestamp: timestamp, pose: pose)
+        }
+        if mode == .verify {
+            result.recognitionDiagnostics = RecognitionDiagnostics(score: currentScore, threshold: VerificationPolicy.sface.threshold,
+                passedThreshold: currentScore.map(VerificationPolicy.sface.accepts), streak: verification.streak,
+                evaluatedFrames: evaluatedFrames, freshFrame: freshFrame, frameTimestamp: currentFrameTimestamp,
+                rejection: result.rejection, model: .sface)
+        }
         if mode == .enroll {
             let pixels = face.map { "\(Int($0.boundingBox.width * Double(CVPixelBufferGetWidth(buffer)))) × \(Int($0.boundingBox.height * Double(CVPixelBufferGetHeight(buffer)))) px" } ?? "Unavailable"
             result.diagnostics = EnrollmentDiagnostics(stage: EnrollmentPosePolicy.stage(enrollment.samples.count), accepted: enrollment.samples.count,
@@ -51,6 +81,7 @@ final class RecognitionPipeline {
                 processedFrames: processedFrames, processedAt: timestamp, poseMode: poseMode,
                 canOfferGuided: faces.count == 1 && (quality ?? 0) >= 0.4 && (pose.yaw == nil || poseRejections >= 6))
         }
+        if result.complete { terminalResult = result }
         return result
     }
 
@@ -65,6 +96,10 @@ final class RecognitionPipeline {
             return reject(faces.isEmpty ? "Looking for face" : "Only one face can be visible.")
         }
         do {
+            if mode == .verify {
+                guard let profile else { throw RecognitionError.noEnrollment }
+                try profile.validate(for: .sface)
+            }
             let w = face.boundingBox.width * Double(CVPixelBufferGetWidth(buffer))
             let h = face.boundingBox.height * Double(CVPixelBufferGetHeight(buffer))
             guard w >= 100, h >= 100 else { return reject("Move closer so your face fills more of the preview.") }
@@ -97,10 +132,13 @@ final class RecognitionPipeline {
             case .verify:
                 guard let profile else { throw RecognitionError.noEnrollment }
                 try profile.validate(for: .sface)
+                guard vector.count == ModelIdentity.sface.dimensions else { throw RecognitionError.invalidEmbedding }
                 let score = try Embedding.cosine(profile.embedding, vector)
+                currentScore = score
+                evaluatedFrames += 1
                 switch verification.observe(score: score, timestamp: timestamp) {
                 case .checking: return RecognitionFrameResult(text: "Checking — keep facing the camera…")
-                case .match: return RecognitionFrameResult(text: "Match — prototype face comparison only.", complete: true)
+                case .match: return RecognitionFrameResult(text: "Inconclusive — three threshold passes observed. Identity acceptance is disabled while the false acceptance is investigated.", complete: true)
                 case .noMatch: return RecognitionFrameResult(text: "No match", complete: true)
                 }
             }

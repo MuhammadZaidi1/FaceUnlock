@@ -82,7 +82,10 @@ public final class SFaceModel: FaceEmbeddingModel {
         configuration.computeUnits = .cpuOnly
         let loaded = try MLModel(contentsOf: MLModel.compileModel(at: url), configuration: configuration)
         guard loaded.modelDescription.inputDescriptionsByName["face"]?.multiArrayConstraint?.shape.map(\.intValue) == [1, 3, 112, 112],
-              loaded.modelDescription.outputDescriptionsByName["embedding"] != nil else {
+              loaded.modelDescription.inputDescriptionsByName["face"]?.multiArrayConstraint?.dataType == .float32,
+              loaded.modelDescription.outputDescriptionsByName["embedding"]?.multiArrayConstraint?.shape.map(\.intValue) == SFaceTensorContract.outputShape,
+              loaded.modelDescription.outputDescriptionsByName["embedding"]?.multiArrayConstraint?.dataType == .float32,
+              loaded.modelDescription.metadata[.versionString] as? String == "2021dec-pipeline1-fp32" else {
             throw ModelAssetError(reason: "unexpected input/output tensor contract.")
         }
         model = loaded
@@ -98,13 +101,12 @@ public final class SFaceModel: FaceEmbeddingModel {
                        bounds: CGRect(x: 0, y: 0, width: 112, height: 112),
                        format: .RGBA8, colorSpace: nil)
         // Core Image renders bitmap rows top-to-bottom; pass unscaled RGB byte values to SFace.
-        var rgb = [Float](repeating: 0, count: 3 * 112 * 112)
+        let rgb = try SFaceTensorContract.channelsFirstRGB(bytes)
         var gray = [Double](repeating: 0, count: 112 * 112)
         for y in 0..<112 {
             for x in 0..<112 {
                 let p = (y * 112 + x) * 4
                 let i = y * 112 + x
-                for c in 0..<3 { rgb[c * 112 * 112 + i] = Float(bytes[p + c]) }
                 gray[i] = 0.299 * Double(bytes[p]) + 0.587 * Double(bytes[p + 1]) + 0.114 * Double(bytes[p + 2])
             }
         }
@@ -130,15 +132,12 @@ public final class SFaceModel: FaceEmbeddingModel {
     }
 
     public func predict(_ rgb: [Float]) throws -> [Float] {
-        guard rgb.count == 3 * 112 * 112, rgb.allSatisfy(\.isFinite) else { throw RecognitionError.invalidEmbedding }
+        try SFaceTensorContract.validateInput(rgb)
         let tensor = try MLMultiArray(shape: [1, 3, 112, 112], dataType: .float32)
         for i in rgb.indices { tensor[i] = NSNumber(value: rgb[i]) }
         let provider = try MLDictionaryFeatureProvider(dictionary: ["face": MLFeatureValue(multiArray: tensor)])
         let output = try load().prediction(from: provider)
-        guard let embedding = output.featureValue(for: "embedding")?.multiArrayValue, embedding.count == 128 else {
-            throw RecognitionError.invalidEmbedding
-        }
-        return try Embedding.normalize((0..<128).map { embedding[$0].floatValue })
+        return try SFaceTensorContract.normalizedOutput(output.featureValue(for: "embedding"))
     }
 
     private func align(_ image: CIImage, face: VNFaceObservation) throws -> CIImage {
@@ -148,8 +147,7 @@ public final class SFaceModel: FaceEmbeddingModel {
         }
         func points(_ region: VNFaceLandmarkRegion2D) -> [CGPoint] {
             region.normalizedPoints.map {
-                CGPoint(x: (face.boundingBox.minX + CGFloat($0.x) * face.boundingBox.width) * image.extent.width,
-                        y: (face.boundingBox.minY + CGFloat($0.y) * face.boundingBox.height) * image.extent.height)
+                FaceAlignment.imagePoint($0, boundingBox: face.boundingBox, extent: image.extent)
             }
         }
         func center(_ points: [CGPoint]) throws -> CGPoint {
@@ -163,30 +161,9 @@ public final class SFaceModel: FaceEmbeddingModel {
             throw FaceQualityError(reason: "Face landmarks are incomplete.")
         }
         let source = [eyes[0], eyes[1], tip, mouthLeft, mouthRight]
-        // OpenCV SFace's five canonical landmarks, converted to Core Image's lower-left origin.
-        let target = [CGPoint(x: 38.2946, y: 112 - 51.6963), CGPoint(x: 73.5318, y: 112 - 51.5014),
-                      CGPoint(x: 56.0252, y: 112 - 71.7366), CGPoint(x: 41.5493, y: 112 - 92.3655),
-                      CGPoint(x: 70.7299, y: 112 - 92.2041)]
-        let aCenter = try center(source), bCenter = try center(target)
-        var real = 0.0, imaginary = 0.0, denominator = 0.0
-        for (s, t) in zip(source, target) {
-            let x = s.x - aCenter.x, y = s.y - aCenter.y
-            let u = t.x - bCenter.x, v = t.y - bCenter.y
-            real += x * u + y * v
-            imaginary += x * v - y * u
-            denominator += x * x + y * y
-        }
-        guard denominator > 1 else { throw FaceQualityError(reason: "Move closer and face the camera.") }
-        let a = real / denominator, b = imaginary / denominator
-        let transform = CGAffineTransform(a: a, b: b, c: -b, d: a,
-                                          tx: bCenter.x - a * aCenter.x + b * aCenter.y,
-                                          ty: bCenter.y - b * aCenter.x - a * aCenter.y)
-        let residual = zip(source, target).reduce(0.0) { total, pair in
-            let p = pair.0.applying(transform)
-            return total + pow(p.x - pair.1.x, 2) + pow(p.y - pair.1.y, 2)
-        }
-        lastQualityMetrics?.alignmentResidual = sqrt(residual / 5)
-        guard sqrt(residual / 5) <= 5 else { throw FaceQualityError(reason: "Face alignment is poor. Look toward the camera.") }
+        let (transform, residual) = try FaceAlignment.transform(source: source, extent: image.extent)
+        lastQualityMetrics?.alignmentResidual = residual
+        guard residual <= 5 else { throw FaceQualityError(reason: "Face alignment is poor. Look toward the camera.") }
         return image.transformed(by: transform).cropped(to: CGRect(x: 0, y: 0, width: 112, height: 112))
     }
 }

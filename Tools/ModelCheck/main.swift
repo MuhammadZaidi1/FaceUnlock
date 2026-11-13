@@ -34,6 +34,15 @@ do {
           try Embedding.cosine(first, different) < 0.9999 else {
         throw RecognitionError.modelUnavailable
     }
+    let repeatCosine = try Embedding.cosine(first, repeated)
+    let differentCosine = try Embedding.cosine(first, different)
+    let firstNorm = sqrt(first.reduce(0.0) { $0 + Double($1) * Double($1) })
+    var negativeDecision = VerificationAccumulator()
+    var result = VerificationDecision.checking
+    for i in 0..<15 { result = negativeDecision.observe(score: differentCosine, timestamp: Double(i)) }
+    guard result == .noMatch else { throw RecognitionError.modelUnavailable }
+    print(String(format: "Synthetic NON-FACE evidence: repeat cosine %.8f; different-input cosine %.8f; unit norm %.8f.", repeatCosine, differentCosine, firstNorm))
+    print("PASS: actual different model outputs lead to No match in the comparison accumulator. This is NOT evidence of real-person accuracy.")
     print("PASS: real SFace Core ML inference; 128 finite dimensions, deterministic and input-dependent. No camera or Keychain used.")
 } catch {
     fputs("FAIL: real SFace inference unavailable: \(error.localizedDescription)\n", stderr)

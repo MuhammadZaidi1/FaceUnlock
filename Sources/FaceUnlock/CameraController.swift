@@ -16,6 +16,8 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
 
     @Published private(set) var diagnostics: EnrollmentDiagnostics?
 
+    @Published private(set) var recognitionDiagnostics: RecognitionDiagnostics?
+
     let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.faceunlock.camera", qos: .userInitiated)
     private var presentationID: UUID?
@@ -65,6 +67,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         completed = false
         candidate = nil
         diagnostics = nil
+        recognitionDiagnostics = nil
         message = "Checking camera permission…"
         faceCount = 0
         isStreaming = false
@@ -123,6 +126,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         presentationCancellation = nil
         presentationID = nil
         diagnostics = nil
+        recognitionDiagnostics = nil
         candidate = nil
         completed = false
         faceCount = 0
@@ -262,13 +266,13 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
                         FacePose(yaw: $0.yaw?.doubleValue, pitch: $0.pitch?.doubleValue, roll: $0.roll?.doubleValue)
                     } : nil
                     let result = pipeline.process(buffer, faces: detected.count == 1 ? (request.results ?? []) : detected,
-                        quality: quality.results?.first?.faceCaptureQuality, timestamp: now, detectorPose: pose)
+                        quality: quality.results?.first?.faceCaptureQuality, timestamp: now, detectorPose: pose, frameTimestamp: timestamp)
                     if result.complete {
                         activeID = nil
                         self.pipeline = nil
                         tearDown()
                     }
-                    publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete, candidate: result.candidate, diagnostics: result.diagnostics)
+                    publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete, candidate: result.candidate, diagnostics: result.diagnostics, recognitionDiagnostics: result.recognitionDiagnostics)
                     return
                 }
                 publish(id, count == 0 ? "No face detected" : (count == 1 ? "Face detected" : "\(count) faces detected"), count: count, streaming: true)
@@ -289,7 +293,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         publish(id, text, denied: denied, complete: true)
     }
 
-    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil, diagnostics: EnrollmentDiagnostics? = nil) {
+    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil, diagnostics: EnrollmentDiagnostics? = nil, recognitionDiagnostics: RecognitionDiagnostics? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.presentationID == id else { return }
             self.message = text
@@ -299,6 +303,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
             self.completed = complete
             self.candidate = candidate
             if let diagnostics { self.diagnostics = diagnostics }
+            self.recognitionDiagnostics = CommandLine.arguments.contains("--recognition-diagnostics") ? recognitionDiagnostics : nil
         }
     }
 }

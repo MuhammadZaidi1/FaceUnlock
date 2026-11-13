@@ -32,7 +32,7 @@ struct PipelineTests {
         let second = pipeline.process(image, faces: [face], quality: 0.8, timestamp: 0.5)
         #expect(!second.complete)
         let third = pipeline.process(image, faces: [face], quality: 0.8, timestamp: 1)
-        #expect(third.complete && third.text.hasPrefix("Match"))
+        #expect(third.complete && third.text.hasPrefix("Inconclusive"))
         #expect(model.calls == 3)
     }
 
