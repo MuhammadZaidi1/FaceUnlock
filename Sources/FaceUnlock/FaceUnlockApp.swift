@@ -7,7 +7,7 @@ struct FaceUnlockApp: App {
 
     var body: some Scene {
         MenuBarExtra("FaceUnlock", systemImage: "faceid") {
-            MenuBarView(appState: appState, openEnrollment: delegate.enrollment.show)
+            MenuBarView(appState: appState, enrollment: delegate.enrollmentManager, verify: delegate.enrollment.verify, openEnrollment: delegate.enrollment.show)
         }
         .menuBarExtraStyle(.window)
     }

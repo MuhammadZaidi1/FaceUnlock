@@ -3,3 +3,5 @@
 .swiftpm/
 dist/
 .DS_Store
+.model-tools/
+.model-work/

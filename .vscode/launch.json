@@ -19,6 +19,26 @@
             "target": "FaceUnlock",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release FaceUnlock"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:FaceUnlock}",
+            "name": "Debug ModelCheck",
+            "target": "ModelCheck",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug ModelCheck"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:FaceUnlock}",
+            "name": "Release ModelCheck",
+            "target": "ModelCheck",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release ModelCheck"
         }
     ]
 }

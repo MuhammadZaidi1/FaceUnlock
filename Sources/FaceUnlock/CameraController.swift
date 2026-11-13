@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Vision
+import RecognitionCore
 
 /// Session configuration, capture callbacks, and Vision work share one serial queue.
 /// Only published UI values and presentationID are accessed on the main thread.
@@ -10,16 +11,24 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
     @Published private(set) var isStreaming = false
     @Published private(set) var permissionDenied = false
 
+    @Published private(set) var completed = false
+    @Published private(set) var candidate: EnrollmentProfile?
+
     let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.faceunlock.camera", qos: .userInitiated)
     private var presentationID: UUID?
+    private var presentationCancellation: CaptureCancellation?
+    private var activeCancellation: CaptureCancellation?
     private var activeID: UUID?
     private var observers: [NSObjectProtocol] = []
     private var lastDetectionTime = 0.0
     private var interrupted = false
+    private var lastFrameTimestamp = -Double.infinity
+    private var pipeline: RecognitionPipeline?
 
-    override init() {
-        super.init()
+    override init() { super.init() }
+
+    private func observeSession(_ id: UUID) {
         let center = NotificationCenter.default
         for name in [AVCaptureSession.wasInterruptedNotification,
                      AVCaptureSession.interruptionEndedNotification,
@@ -32,7 +41,8 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
                 let deviceID = (notification.object as? AVCaptureDevice)?.uniqueID
                 let error = (notification.userInfo?[AVCaptureSessionErrorKey] as? Error)?.localizedDescription
                 self?.queue.async { [weak self] in
-                    self?.handle(name, isOurSession: isOurSession, deviceID: deviceID, error: error)
+                    guard let self, self.activeID == id else { return }
+                    self.handle(name, isOurSession: isOurSession, deviceID: deviceID, error: error)
                 }
             })
         }
@@ -43,18 +53,44 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
     }
 
     /// Called only when the setup window opens or the user explicitly retries.
-    func start() {
+    func start(pipeline: RecognitionPipeline? = nil, timeout: TimeInterval = 90) {
         dispatchPrecondition(condition: .onQueue(.main))
+        presentationCancellation?.cancel()
+        let cancellation = CaptureCancellation()
+        presentationCancellation = cancellation
         let id = UUID()
         presentationID = id
+        completed = false
+        candidate = nil
         message = "Checking camera permission…"
         faceCount = 0
         isStreaming = false
         permissionDenied = false
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !cancellation.isCancelled else { return }
             self.tearDown()
+            self.activeCancellation = cancellation
             self.activeID = id
+            self.pipeline = pipeline
+            self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                guard let self, self.activeID == id else { return }
+                self.activeID = nil
+                self.tearDown()
+                self.pipeline = nil
+                self.publish(id, "Camera session timed out. Close or retry.", complete: true)
+            }
+            do {
+                if let pipeline {
+                    self.publish(id, "Loading local face model…")
+                    try pipeline.prepare()
+                }
+            } catch {
+                self.activeID = nil
+                self.pipeline = nil
+                self.publish(id, "Error: \(error.localizedDescription)", complete: true)
+                return
+            }
+            guard !cancellation.isCancelled else { return }
             switch AVCaptureDevice.authorizationStatus(for: .video) {
             case .authorized:
                 self.configureAndStart(id)
@@ -64,15 +100,15 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
                     self?.queue.async { [weak self] in
                         guard let self, self.activeID == id else { return }
                         if granted { self.configureAndStart(id) }
-                        else { self.publish(id, "Camera access denied. Allow FaceUnlock in System Settings → Privacy & Security → Camera.", denied: true) }
+                        else { self.fail(id, "Camera access denied. Allow FaceUnlock in System Settings → Privacy & Security → Camera.", denied: true) }
                     }
                 }
             case .denied:
-                self.publish(id, "Camera access denied. Allow FaceUnlock in System Settings → Privacy & Security → Camera.", denied: true)
+                self.fail(id, "Camera access denied. Allow FaceUnlock in System Settings → Privacy & Security → Camera.", denied: true)
             case .restricted:
-                self.publish(id, "Camera access is restricted by macOS or device management.")
+                self.fail(id, "Camera access is restricted by macOS or device management.")
             @unknown default:
-                self.publish(id, "Camera permission is unavailable on this system.")
+                self.fail(id, "Camera permission is unavailable on this system.")
             }
         }
     }
@@ -80,22 +116,35 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
     func stop(wait: Bool = false) {
         dispatchPrecondition(condition: .onQueue(.main))
         // Invalidates queued UI updates and permission replies before stopping capture.
+        presentationCancellation?.cancel()
+        presentationCancellation = nil
         presentationID = nil
+        candidate = nil
+        completed = false
         faceCount = 0
         isStreaming = false
         message = "Camera is stopped"
         let work = { [self] in
             activeID = nil
+            activeCancellation = nil
+            pipeline = nil
             tearDown()
         }
         if wait { queue.sync(execute: work) }
         else { queue.async(execute: work) }
     }
 
+    func report(_ text: String) {
+        stop(wait: true)
+        candidate = nil
+        completed = true
+        message = text
+    }
+
     private func configureAndStart(_ id: UUID) {
-        guard activeID == id else { return }
+        guard activeID == id, activeCancellation?.isCancelled == false else { return }
         guard let device = AVCaptureDevice.default(for: .video) else {
-            publish(id, "No camera available. Connect a camera, then choose Retry.")
+            fail(id, "No camera available. Connect a camera, then choose Retry.")
             return
         }
         do {
@@ -108,30 +157,36 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
             if session.canSetSessionPreset(.medium) { session.sessionPreset = .medium }
             guard session.canAddInput(input) else {
                 session.commitConfiguration()
-                publish(id, "Unable to use this camera. Close other camera apps, then retry.")
+                fail(id, "Unable to use this camera. Close other camera apps, then retry.")
                 return
             }
             session.addInput(input)
             guard session.canAddOutput(output) else {
                 session.removeInput(input)
                 session.commitConfiguration()
-                publish(id, "Camera video output is unavailable.")
+                fail(id, "Camera video output is unavailable.")
                 return
             }
             session.addOutput(output)
             session.commitConfiguration()
             lastDetectionTime = 0
+            lastFrameTimestamp = -Double.infinity
             publish(id, "Starting camera…")
+            observeSession(id)
             session.startRunning()
             if !session.isRunning {
-                publish(id, "Camera could not start. Close other camera apps, then retry.")
+                fail(id, "Camera could not start. Close other camera apps, then retry.")
             }
         } catch {
-            publish(id, "Unable to open camera: \(error.localizedDescription)")
+            fail(id, "Unable to open camera: \(error.localizedDescription)")
         }
     }
 
     private func tearDown() {
+        // Remove observers before intentional stop; notifications queued by an older
+        // run carry its UUID and cannot stop or alter a replacement capture session.
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
         interrupted = false
         session.stopRunning()
         session.beginConfiguration()
@@ -147,11 +202,11 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         guard let id = activeID else { return }
         if name == AVCaptureDevice.wasDisconnectedNotification {
             guard session.inputs.compactMap({ ($0 as? AVCaptureDeviceInput)?.device.uniqueID }).contains(deviceID ?? "") else { return }
-            tearDown()
-            publish(id, "Camera disconnected. Reconnect it, then choose Retry.")
+            fail(id, "Camera disconnected. Reconnect it, then choose Retry.")
             return
         }
         guard isOurSession else { return }
+        pipeline?.interrupt()
         switch name {
         case AVCaptureSession.wasInterruptedNotification:
             interrupted = true
@@ -162,40 +217,85 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
             if !session.isRunning { session.startRunning() }
             publish(id, "Resuming camera…")
         case AVCaptureSession.runtimeErrorNotification:
-            tearDown()
-            publish(id, "Camera error: \(error ?? "Capture stopped"). Choose Retry to reconnect.")
+            fail(id, "Camera error: \(error ?? "Capture stopped"). Choose Retry to reconnect.")
         case AVCaptureSession.didStopRunningNotification:
-            publish(id, "Camera stopped. Choose Retry to reconnect.")
+            if !interrupted { fail(id, "Camera stopped. Choose Retry to reconnect.") }
         default: break
         }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let id = activeID, session.isRunning, !interrupted else { return }
+        guard let id = activeID, activeCancellation?.isCancelled == false, session.isRunning, !interrupted else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastDetectionTime >= 0.2 else { return }
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        guard timestamp.isFinite, timestamp > lastFrameTimestamp else { return }
+        lastFrameTimestamp = timestamp
+        guard now - lastDetectionTime >= (pipeline == nil ? 0.2 : 0.5) else { return }
         lastDetectionTime = now
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         // Process this frame synchronously; never enqueue or retain a frame backlog.
         autoreleasepool {
             do {
-                let request = VNDetectFaceRectanglesRequest()
+                let request = VNDetectFaceLandmarksRequest()
                 try VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:]).perform([request])
                 let count = request.results?.count ?? 0
+                if let pipeline {
+                    let quality = VNDetectFaceCaptureQualityRequest()
+                    quality.inputFaceObservations = request.results
+                    try VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:]).perform([quality])
+                    let result = pipeline.process(buffer, faces: request.results ?? [], quality: quality.results?.first?.faceCaptureQuality, timestamp: now)
+                    if result.complete {
+                        activeID = nil
+                        self.pipeline = nil
+                        tearDown()
+                    }
+                    publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete, candidate: result.candidate)
+                    return
+                }
                 publish(id, count == 0 ? "No face detected" : (count == 1 ? "Face detected" : "\(count) faces detected"), count: count, streaming: true)
             } catch {
-                publish(id, "Face detection unavailable. Choose Retry.", streaming: true)
+                activeID = nil
+                pipeline = nil
+                tearDown()
+                publish(id, "Error: face analysis unavailable. Close and retry.", complete: true)
             }
         }
     }
 
-    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false) {
+    private func fail(_ id: UUID, _ text: String, denied: Bool = false) {
+        guard activeID == id else { return }
+        activeID = nil
+        pipeline = nil
+        tearDown()
+        publish(id, text, denied: denied, complete: true)
+    }
+
+    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.presentationID == id else { return }
             self.message = text
             self.faceCount = count
             self.isStreaming = streaming
             self.permissionDenied = denied
+            self.completed = complete
+            self.candidate = candidate
         }
+    }
+}
+
+/// Closing invalidates a pending permission/model-load request immediately, even
+/// while the serial capture queue is busy. Mutable state is protected by a lock.
+private final class CaptureCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
     }
 }

@@ -3,7 +3,10 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var enrollment: EnrollmentManager
+    let verify: () -> Void
     let openEnrollment: () -> Void
+    @State private var confirmDeletion = false
     @State private var placeholder: Placeholder?
 
     var body: some View {
@@ -17,13 +20,14 @@ struct MenuBarView: View {
                 Label(appState.status, systemImage: appState.isEnabled ? "circle.dotted" : "pause.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Recognition is not implemented. Your Mac’s authentication is unchanged.")
+                Text(enrollment.status).font(.caption)
+                Text("Prototype face matching. No reliable anti-spoofing. Does not unlock your Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Toggle("Enable Face Recognition", isOn: $appState.isEnabled)
+            Toggle("Enable (preference only)", isOn: $appState.isEnabled)
                 .toggleStyle(.switch)
                 .controlSize(.small)
 
@@ -31,8 +35,23 @@ struct MenuBarView: View {
 
             VStack(spacing: 8) {
                 Button(action: openEnrollment) {
-                    Label("Enroll Face…", systemImage: "person.crop.square")
+                    Label(enrollment.profile == nil ? "Enroll Face…" : "Replace Face…", systemImage: "person.crop.square")
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(enrollment.busy)
+                Button(action: verify) {
+                    Label("Verify Face…", systemImage: "person.badge.shield.checkmark")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(enrollment.busy || enrollment.cameraWindowOpen)
+                Button(role: .destructive) { confirmDeletion = true } label: {
+                    Label("Delete Enrollment…", systemImage: "trash")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(enrollment.busy || enrollment.cameraWindowOpen || (enrollment.profile == nil && !enrollment.storageFailed))
+                if enrollment.storageFailed {
+                    Button("Retry Enrollment Access") { enrollment.reload() }
+                        .disabled(enrollment.busy || enrollment.cameraWindowOpen)
                 }
                 Button { placeholder = .settings } label: {
                     Label("Settings…", systemImage: "gearshape")
@@ -49,6 +68,12 @@ struct MenuBarView: View {
         }
         .padding(18)
         .frame(width: 300)
+        .confirmationDialog("Delete local enrollment?", isPresented: $confirmDeletion, titleVisibility: .visible) {
+            Button("Delete Enrollment", role: .destructive) { enrollment.delete() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This deletes the FaceUnlock Keychain record. You will need to enroll again.")
+        }
         .alert(item: $placeholder) { item in
             Alert(
                 title: Text(item.title),
