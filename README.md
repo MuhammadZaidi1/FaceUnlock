@@ -6,6 +6,66 @@ Phase 3 adds one-person enrollment and live identity comparison using a genuine 
 
 **Prototype only: no reliable anti-spoofing and not suitable for security-critical authentication.** A photograph or screen replay may match. FaceUnlock does not unlock macOS, enter passwords, install login hooks, request administrator privileges, or modify authentication. The Enable switch remains a saved preference only and never starts a background camera session.
 
+## v0.3.1 — enrollment stall investigation and layout
+
+Confirmed code defect: the old pipeline read `face.yaw?.doubleValue ?? 0` from landmark observations. Missing yaw therefore passed the first two front-facing samples as zero, but could never enter either side range. Repeated missing measurements reproduced the permanent 2/6 state until timeout. The capture path only requested landmarks, while [Apple documents yaw on face-detection observations, in radians, and permits nil when not computed](https://developer.apple.com/documentation/vision/vnfaceobservation/yaw). v0.3.1 explicitly runs revision-3 face detection, passes those observations into landmarks, and transports the detector's pose separately to the pipeline. Missing yaw is now reported as unavailable and never counted as a validated front or side pose.
+
+The suspected contradictory global/side yaw limits are **not present**: positive side samples require 0.1…0.3 radians (5.73…17.19°), negative samples −0.3…−0.1, all inside the unchanged global limit ±0.35 radians (20.05°). Regression tests exercise both signed boundaries and 0/6→6/6. Both global limits and side ranges are now defined in one tested policy. Radians are used for gating; degrees are display-only. Capture remains unmirrored and `.up` for normally oriented macOS webcams; the preview alone is mirrored. No yaw-sign flip is applied based on preview mirroring. Guidance uses “one side / other side” rather than guessing the person's left/right from screen coordinates.
+
+**The exact runtime cause on the reported MacBook is not yet confirmed.** We reproduced the missing-yaw failure, not the user's camera measurements. Coarse/unchanging yaw (for example 0 and ±π/4), insufficient capture quality, alignment residual, blur, lighting, or identity rejection could independently prevent progression. A synthetic coarse-yaw test demonstrates why enlarging a side range alone cannot solve that case without violating the global limit. This release does not assert that Apple always quantizes yaw, nor claim that live enrollment is fixed from passing tests alone. There was no code evidence of a global-range contradiction, angle conversion, preview-sign flip, sample-counter race, or timestamp deadlock. Existing 0.5-second analysis throttling and 0.7-second sample spacing deliberately accept at most roughly one enrollment sample per second.
+
+The normal UI now shows accepted count, stage, and contextual rejection guidance. Scalar model-quality telemetry reports alignment RMS, brightness/clipping, and blur variance for the current evaluated frame only. It does not change the SFace model, alignment algorithm, thresholds, embedding metadata, or Keychain storage format. Identity similarity remains 0.363; capture quality remains 0.4; all other quality limits are preserved.
+
+If a single good-quality face has no yaw, or repeatedly fails pose checks (six analyzed frames since the last acceptance), **Use guided samples with unvalidated turns…** becomes available. This is an explicit, confirmed fallback, not an automatic claim that head movement was verified. Confirming restarts all six samples and labels the flow and completion result **head turns NOT validated**. Vary pose naturally. Global pose limits when measured, exactly-one-face, size, quality, landmarks/alignment, lighting, blur, real-model inference, and same-identity checks still apply. Retry remains in the chosen mode until the window closes; reopening starts with validated turns again. Cancelling or declining fallback never changes the saved profile. Use this only when the diagnostic readings cannot validate small turns on your hardware; it is not a liveness check.
+
+The window is resizable from 420 points wide (maximum 560), starts within the screen's visible height, and has a vertically scrolling content region with wrapping labels. Action buttons sit outside the scroll view so they remain visible at the minimum 420-point content height. The preview is 220 points high. A camera-free test rendered and visually inspected light/dark layouts at 420×460 with a long status message: text wraps and Retry/Cancel remain visible. Content below the viewport is reached by vertical scrolling, not ellipsized labels or horizontal scrolling. Actual camera preview, expanded diagnostics, Save/permission-dialog combinations, and your system's accessibility/text settings still need manual inspection.
+
+Changed files in this release:
+
+- `RecognitionPipeline.swift`: explicit pose input, missing-pose rejection, stage diagnostics, contextual reasons, and explicit guided-sample mode.
+- `EnrollmentPosePolicy.swift` (new): centralized radians/ranges, stages, degree conversion, and pose guidance.
+- `CameraController.swift`: rectangle→landmark→quality requests, separate detector pose, current-frame diagnostics, explicit unmirrored capture.
+- `CameraCoordinates.swift` (new) and `CameraPreview.swift`: shared, tested capture/preview orientation convention.
+- `SFaceModel.swift`: transient scalar quality metrics, without changing inference or quality cutoffs.
+- `EnrollmentDiagnostics.swift` (new): transient diagnostic snapshot; no vectors, images, profile data, logs, or persistence.
+- `EnrollmentView.swift` and `EnrollmentWindowController.swift`: wrapping/scrolling, pinned footer, resizable screen-aware sizing, explicit fallback confirmation/restart, developer disclosure.
+- `EnrollmentRegressionTests.swift` and `EnrollmentLayoutTests.swift` (new): pose/state/fallback/quality/identity/shutdown regressions and light/dark minimum-size layout checks.
+- `Resources/Info.plist`: version 0.3.1, build 4; camera description and `LSUIElement` preserved. `README.md`: this investigation and testing guide. Packaging/model assets, secure storage, deletion confirmation, and verification thresholds remain unchanged.
+
+### Developer diagnostics and MacBook retest
+
+Quit the previous app first. Do not use `-n` to run simultaneous copies. Build and launch with the developer-only flag:
+
+```sh
+bash scripts/package-app.sh release
+open dist/FaceUnlock.app --args --enrollment-diagnostics
+```
+
+Open Enroll/Replace, then expand **Developer diagnostics — transient, not logged**. This section is absent on normal launches and collapsed initially even with the flag. It displays the stage, accepted count, yaw/pitch/roll degrees, expected yaw range, latest rejection, capture quality, face size, alignment/brightness/clipping/blur metrics, processed-frame counter, time since the last analyzed frame, and whether capture is active. “—” means unavailable or not evaluated on that frame. Nothing is written to disk or the console. Do not share camera imagery or enrollment vectors when reporting a problem.
+
+1. In good light, accept the two front samples. Slowly turn one way; reverse if the guidance says the other side. Watch the **raw signed yaw**, expected range, latest rejection, and advancing frame count. A valid pose in the expected range must still pass all quality/identity checks before the count increases. Then turn the opposite way for samples 5–6.
+2. If yaw stays at zero, becomes unavailable, or jumps outside the global limit, note that scalar observation and the rejection text. Do not increase pose or identity thresholds. Try explicit guided mode only if pose validation remains unusable; confirm its restart at 0/6, persistent unvalidated-turn warning, and eventual 6/6 quality samples. If quality/alignment/blur is failing instead, correct that condition rather than using fallback to bypass it (fallback cannot do so).
+3. Expand diagnostics while resizing to minimum size, in both system light and dark appearances. Scroll through all text; verify no ellipses, no horizontal scroll, and that Cancel, Retry, Camera Settings (after denial), and Save Enrollment (after completion) remain reachable. Test closing/cancelling at 2/6 and at 6/6 without Save: old enrollment must remain intact. Then explicitly save a replacement and run Match/nonmatch tests.
+4. Unplug a USB camera, deny camera access, and close/quit during capture. Confirm the camera-use indicator clears, no sample/candidate is committed after an error, and the old enrollment remains. Automated shutdown checks exercise an empty session plus pipeline terminal-error results; they do not replace these active-hardware tests.
+
+Normal launch without diagnostics, after quitting the diagnostic instance:
+
+```sh
+open dist/FaceUnlock.app
+```
+
+Regression commands (the optional snapshot command uses only an empty preview/test storage and briefly shows a test window; it captures no webcam images):
+
+```sh
+bash scripts/test.sh
+FACEUNLOCK_LAYOUT_SNAPSHOTS=/tmp/faceunlock-v031-layout bash scripts/test.sh
+bash scripts/package-app.sh debug
+bash scripts/package-app.sh release
+bash scripts/validate-app.sh
+```
+
+The suite now has **29 tests**. Existing replacement/cancellation/deletion tests remain in place alongside the new regressions. Core ML model parity and packaged-resource checks remain separate from deterministic model mocks used only in unit tests. Live confirmation on the MacBook is still required. Native app automation timed out during the final menu-bar inspection; the release launch/process check succeeded, but clicking the menu-bar icon and checking a live preview remain manual tests.
+
 ## Toolchain setup
 
 1. Install VS Code for macOS and the **Swift** extension (`swiftlang.swift-vscode`). In VS Code, use the Command Palette → **Shell Command: Install 'code' command in PATH** if you want to open the project from Terminal.
@@ -208,4 +268,4 @@ No Keychain item or camera decision is reset automatically by the tests or build
 
 ## Validation record
 
-Automated validation on this Apple Silicon machine: 19 Swift Testing unit/pipeline/manager tests; real Python Core ML versus ONNX parity on four synthetic inputs; real Swift Core ML inference and pixel-orientation checks; debug/release arm64 builds and packaging; signature/plist/model-resource checks; missing-model/corrupt-manifest failure checks; and a release launch/process smoke check. No actual face enrollment, live identity result, macOS Keychain authorization/persistence, or anti-spoofing result is claimed from these checks. Full Xcode is optional for app builds with the installed working Command Line Tools; use the toolchain instructions above if your SDK differs.
+Automated validation on this Apple Silicon machine: 29 Swift Testing unit/pipeline/manager/layout tests; real Python Core ML versus ONNX parity on four synthetic inputs; real Swift Core ML inference and pixel-orientation checks; debug/release arm64 builds and packaging; signature/plist/model-resource checks; missing-model/corrupt-manifest failure checks; and a release launch/process smoke check. No actual face enrollment, live identity result, macOS Keychain authorization/persistence, or anti-spoofing result is claimed from these checks. Full Xcode is optional for app builds with the installed working Command Line Tools; use the toolchain instructions above if your SDK differs.

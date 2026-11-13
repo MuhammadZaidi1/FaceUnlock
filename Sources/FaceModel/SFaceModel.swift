@@ -9,23 +9,34 @@ private struct ModelAssetError: LocalizedError {
     var errorDescription: String? { "Face model unavailable: " + reason }
 }
 
+public struct FaceQualityMetrics: Sendable {
+    public var alignmentResidual: Double?
+    public var meanLuminance: Double?
+    public var clippedFraction: Double?
+    public var laplacianVariance: Double?
+}
+
 public struct FaceQualityError: LocalizedError {
     let reason: String
+    public init(reason: String) { self.reason = reason }
     public var errorDescription: String? { reason }
 }
 
 public protocol FaceEmbeddingModel {
+    var lastQualityMetrics: FaceQualityMetrics? { get }
     func prepare() throws
     func embedding(from buffer: CVPixelBuffer, face: VNFaceObservation) throws -> [Float]
 }
 
 public extension FaceEmbeddingModel {
+    var lastQualityMetrics: FaceQualityMetrics? { nil }
     func prepare() throws {}
 }
 
 /// SFace MobileFaceNet weights, not a generic Vision feature print.
 /// Used serially on the capture queue; model compilation/inference never runs on the UI thread.
 public final class SFaceModel: FaceEmbeddingModel {
+    public private(set) var lastQualityMetrics: FaceQualityMetrics?
     public init() {}
     public func prepare() throws { _ = try load() }
     private var model: MLModel?
@@ -79,6 +90,7 @@ public final class SFaceModel: FaceEmbeddingModel {
     }
 
     public func embedding(from buffer: CVPixelBuffer, face: VNFaceObservation) throws -> [Float] {
+        lastQualityMetrics = FaceQualityMetrics()
         let image = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
         let aligned = try align(image, face: face)
         var bytes = [UInt8](repeating: 0, count: 112 * 112 * 4)
@@ -98,6 +110,8 @@ public final class SFaceModel: FaceEmbeddingModel {
         }
         let mean = gray.reduce(0, +) / Double(gray.count)
         let clipped = gray.filter { $0 < 15 || $0 > 240 }.count
+        lastQualityMetrics?.meanLuminance = mean
+        lastQualityMetrics?.clippedFraction = Double(clipped) / Double(gray.count)
         guard (45...210).contains(mean), Double(clipped) / Double(gray.count) < 0.3 else {
             throw FaceQualityError(reason: "Lighting is too dark, bright, or uneven. Face a soft light.")
         }
@@ -110,6 +124,7 @@ public final class SFaceModel: FaceEmbeddingModel {
         }
         let lapMean = laplacian.reduce(0, +) / Double(laplacian.count)
         let variance = laplacian.reduce(0) { $0 + pow($1 - lapMean, 2) } / Double(laplacian.count)
+        lastQualityMetrics?.laplacianVariance = variance
         guard variance >= 70 else { throw FaceQualityError(reason: "Image is blurry. Hold still and check camera focus.") }
         return try predict(rgb)
     }
@@ -170,6 +185,7 @@ public final class SFaceModel: FaceEmbeddingModel {
             let p = pair.0.applying(transform)
             return total + pow(p.x - pair.1.x, 2) + pow(p.y - pair.1.y, 2)
         }
+        lastQualityMetrics?.alignmentResidual = sqrt(residual / 5)
         guard sqrt(residual / 5) <= 5 else { throw FaceQualityError(reason: "Face alignment is poor. Look toward the camera.") }
         return image.transformed(by: transform).cropped(to: CGRect(x: 0, y: 0, width: 112, height: 112))
     }

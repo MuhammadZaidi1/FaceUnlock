@@ -9,8 +9,8 @@
     <key>CFBundleName</key><string>FaceUnlock</string>
     <key>CFBundleDisplayName</key><string>FaceUnlock</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.3.0</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>0.3.1</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSCameraUsageDescription</key><string>FaceUnlock uses the camera only in temporary setup windows to preview video, enroll a face embedding, and compare faces locally. No camera images are saved or uploaded.</string>

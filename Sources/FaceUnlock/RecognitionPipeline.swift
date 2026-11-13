@@ -7,6 +7,8 @@ struct RecognitionFrameResult {
     let text: String
     var complete = false
     var candidate: EnrollmentProfile?
+    var diagnostics: EnrollmentDiagnostics?
+    var rejection: String?
 }
 
 enum RecognitionMode { case enroll, verify }
@@ -19,18 +21,40 @@ final class RecognitionPipeline {
     private var enrollment = EnrollmentTransaction()
     private var verification = VerificationAccumulator()
     private var startedAt: TimeInterval?
+    private let poseMode: EnrollmentPoseMode
+    private var didInvokeModel = false
+    private var processedFrames = 0
+    private var poseRejections = 0
     private var lastSample = -Double.infinity
 
-    init(mode: RecognitionMode, profile: EnrollmentProfile?, model: FaceEmbeddingModel = SFaceModel()) {
+    init(mode: RecognitionMode, profile: EnrollmentProfile?, model: FaceEmbeddingModel = SFaceModel(), poseMode: EnrollmentPoseMode = .validated) {
         self.mode = mode
         self.profile = profile
         self.model = model
+        self.poseMode = poseMode
     }
 
     func prepare() throws { try model.prepare() }
     func interrupt() { verification.resetStreak() }
 
-    func process(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval) -> RecognitionFrameResult {
+    func process(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval, detectorPose: FacePose? = nil) -> RecognitionFrameResult {
+        didInvokeModel = false
+        processedFrames += 1
+        let face = faces.count == 1 ? faces.first : nil
+        let pose = detectorPose ?? FacePose(yaw: face?.yaw?.doubleValue, pitch: face?.pitch?.doubleValue, roll: face?.roll?.doubleValue)
+        var result = processFrame(buffer, faces: faces, quality: quality, timestamp: timestamp, pose: pose)
+        if mode == .enroll {
+            let pixels = face.map { "\(Int($0.boundingBox.width * Double(CVPixelBufferGetWidth(buffer)))) × \(Int($0.boundingBox.height * Double(CVPixelBufferGetHeight(buffer)))) px" } ?? "Unavailable"
+            result.diagnostics = EnrollmentDiagnostics(stage: EnrollmentPosePolicy.stage(enrollment.samples.count), accepted: enrollment.samples.count,
+                pose: pose, expected: EnrollmentPosePolicy.expected(enrollment.samples.count, mode: poseMode), rejection: result.rejection,
+                captureQuality: quality, facePixels: pixels, modelQuality: didInvokeModel ? model.lastQualityMetrics : nil,
+                processedFrames: processedFrames, processedAt: timestamp, poseMode: poseMode,
+                canOfferGuided: faces.count == 1 && (quality ?? 0) >= 0.4 && (pose.yaw == nil || poseRejections >= 6))
+        }
+        return result
+    }
+
+    private func processFrame(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval, pose: FacePose) -> RecognitionFrameResult {
         if startedAt == nil { startedAt = timestamp }
         let duration = timestamp - (startedAt ?? timestamp)
         if duration > (mode == .verify ? 20 : 90) {
@@ -38,7 +62,7 @@ final class RecognitionPipeline {
         }
         guard faces.count == 1, let face = faces.first else {
             verification.resetStreak()
-            return RecognitionFrameResult(text: faces.isEmpty ? "Looking for face" : "Only one person should be in view.")
+            return reject(faces.isEmpty ? "Looking for face" : "Only one face can be visible.")
         }
         do {
             let w = face.boundingBox.width * Double(CVPixelBufferGetWidth(buffer))
@@ -47,29 +71,27 @@ final class RecognitionPipeline {
             guard let quality, quality >= 0.4 else {
                 return reject("Face quality is low. Improve lighting, uncover your face, and hold still.")
             }
-            let yaw = face.yaw?.doubleValue ?? 0
-            let roll = face.roll?.doubleValue ?? 0
-            let pitch = face.pitch?.doubleValue ?? 0
-            guard abs(yaw) <= 0.35, abs(roll) <= 0.2, abs(pitch) <= 0.25 else {
-                return reject("Face the camera with only a slight head turn.")
+            if let reason = EnrollmentPosePolicy.globalRejection(pose) {
+                poseRejections += 1
+                return reject(reason)
             }
             if mode == .enroll {
-                let count = enrollment.samples.count
-                let poseOK = count < 2 ? abs(yaw) < 0.1 : (count < 4 ? yaw >= 0.1 && yaw <= 0.3 : yaw <= -0.1 && yaw >= -0.3)
-                guard poseOK else {
-                    let wrongSide = (count >= 2 && count < 4 && yaw < -0.1) || (count >= 4 && yaw > 0.1)
-                    return reject(wrongSide ? "\(count) of 6 · Turn slightly toward the other side." : instruction)
+                if let reason = EnrollmentPosePolicy.rejection(pose, count: enrollment.samples.count, mode: poseMode) {
+                    poseRejections += 1
+                    return reject(reason)
                 }
-                guard timestamp - lastSample >= 0.7 else { return RecognitionFrameResult(text: instruction) }
+                guard timestamp - lastSample >= 0.7 else { return reject("Hold still while the next distinct sample arrives.") }
             }
+            didInvokeModel = true
             let vector = try model.embedding(from: buffer, face: face)
             switch mode {
             case .enroll:
                 try enrollment.append(vector)
+                poseRejections = 0
                 lastSample = timestamp
                 if enrollment.samples.count == EnrollmentTransaction.requiredSamples {
                     let candidate = try EnrollmentProfile(model: .sface, embedding: Embedding.centroid(enrollment.samples))
-                    return RecognitionFrameResult(text: "6 of 6 samples ready. Review and Save Enrollment, or Cancel.", complete: true, candidate: candidate)
+                    return RecognitionFrameResult(text: poseMode == .guided ? "6 of 6 quality samples ready. Head turns were NOT validated. Save or Cancel." : "6 of 6 samples ready. Save Enrollment, or Cancel.", complete: true, candidate: candidate)
                 }
                 return RecognitionFrameResult(text: instruction)
             case .verify:
@@ -87,18 +109,19 @@ final class RecognitionPipeline {
         } catch RecognitionError.inconsistentSamples {
             return reject("Samples differ from the first face. Keep the same person in view, or Cancel and retry.")
         } catch {
-            return RecognitionFrameResult(text: "Error: \(error.localizedDescription)", complete: true)
+            return RecognitionFrameResult(text: "Error: \(error.localizedDescription)", complete: true, rejection: error.localizedDescription)
         }
     }
 
     private func reject(_ text: String) -> RecognitionFrameResult {
         verification.resetStreak()
-        return RecognitionFrameResult(text: text)
+        return RecognitionFrameResult(text: text, rejection: text)
     }
 
     private var instruction: String {
         let n = enrollment.samples.count
-        let pose = n < 2 ? "Look straight ahead and hold still." : (n < 4 ? "Turn your head slightly one way." : "Turn slightly the opposite way.")
+        if poseMode == .guided { return "\(n) of 6 quality samples · Vary your pose naturally. Head turns are not validated." }
+        let pose = n < 2 ? "Look straight ahead and hold still." : (n < 4 ? "Slowly turn to one side; reverse if asked." : "Slowly turn toward the opposite side.")
         return "\(n) of 6 samples · \(pose)"
     }
 }

@@ -14,6 +14,8 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
     @Published private(set) var completed = false
     @Published private(set) var candidate: EnrollmentProfile?
 
+    @Published private(set) var diagnostics: EnrollmentDiagnostics?
+
     let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.faceunlock.camera", qos: .userInitiated)
     private var presentationID: UUID?
@@ -62,6 +64,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         presentationID = id
         completed = false
         candidate = nil
+        diagnostics = nil
         message = "Checking camera permission…"
         faceCount = 0
         isStreaming = false
@@ -119,6 +122,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         presentationCancellation?.cancel()
         presentationCancellation = nil
         presentationID = nil
+        diagnostics = nil
         candidate = nil
         completed = false
         faceCount = 0
@@ -168,6 +172,11 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
                 return
             }
             session.addOutput(output)
+            // Inference sees unmirrored sensor frames. Only the preview is mirrored.
+            if let connection = output.connection(with: .video), connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = CameraCoordinates.captureMirrored
+            }
             session.commitConfiguration()
             lastDetectionTime = 0
             lastFrameTimestamp = -Double.infinity
@@ -236,20 +245,30 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         // Process this frame synchronously; never enqueue or retain a frame backlog.
         autoreleasepool {
             do {
+                let detector = VNDetectFaceRectanglesRequest()
+                detector.revision = VNDetectFaceRectanglesRequestRevision3
+                let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: CameraCoordinates.visionOrientation, options: [:])
+                try handler.perform([detector])
                 let request = VNDetectFaceLandmarksRequest()
-                try VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:]).perform([request])
+                request.inputFaceObservations = detector.results
+                try handler.perform([request])
                 let count = request.results?.count ?? 0
                 if let pipeline {
                     let quality = VNDetectFaceCaptureQualityRequest()
                     quality.inputFaceObservations = request.results
-                    try VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:]).perform([quality])
-                    let result = pipeline.process(buffer, faces: request.results ?? [], quality: quality.results?.first?.faceCaptureQuality, timestamp: now)
+                    try VNImageRequestHandler(cvPixelBuffer: buffer, orientation: CameraCoordinates.visionOrientation, options: [:]).perform([quality])
+                    let detected = detector.results ?? []
+                    let pose = detected.count == 1 ? detected.first.map {
+                        FacePose(yaw: $0.yaw?.doubleValue, pitch: $0.pitch?.doubleValue, roll: $0.roll?.doubleValue)
+                    } : nil
+                    let result = pipeline.process(buffer, faces: detected.count == 1 ? (request.results ?? []) : detected,
+                        quality: quality.results?.first?.faceCaptureQuality, timestamp: now, detectorPose: pose)
                     if result.complete {
                         activeID = nil
                         self.pipeline = nil
                         tearDown()
                     }
-                    publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete, candidate: result.candidate)
+                    publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete, candidate: result.candidate, diagnostics: result.diagnostics)
                     return
                 }
                 publish(id, count == 0 ? "No face detected" : (count == 1 ? "Face detected" : "\(count) faces detected"), count: count, streaming: true)
@@ -270,7 +289,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         publish(id, text, denied: denied, complete: true)
     }
 
-    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil) {
+    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil, diagnostics: EnrollmentDiagnostics? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.presentationID == id else { return }
             self.message = text
@@ -279,6 +298,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
             self.permissionDenied = denied
             self.completed = complete
             self.candidate = candidate
+            if let diagnostics { self.diagnostics = diagnostics }
         }
     }
 }

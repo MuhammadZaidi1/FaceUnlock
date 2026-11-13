@@ -1,11 +1,13 @@
 import AppKit
 import SwiftUI
+import RecognitionCore
 
 /// Owns one temporary window and one capture session for enrollment or verification.
 @MainActor
 final class EnrollmentWindowController: NSObject, NSWindowDelegate {
     private let camera = CameraController()
     private let manager: EnrollmentManager
+    private var poseMode = EnrollmentPoseMode.validated
     private var mode = RecognitionMode.enroll
     private var window: NSWindow?
 
@@ -22,15 +24,22 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
         }
         guard !manager.busy else { return }
         self.mode = mode
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
-                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        poseMode = .validated
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: min(640, (NSScreen.main?.visibleFrame.height ?? 800) - 80)),
+                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = mode == .enroll ? "FaceUnlock Enrollment" : "FaceUnlock Verification"
+        window.contentMinSize = NSSize(width: 420, height: 420)
+        window.contentMaxSize = NSSize(width: 560, height: 1000)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.contentView = NSHostingView(rootView: EnrollmentView(camera: camera, manager: manager, mode: mode,
             retry: { [weak self] in self?.restart() },
             close: { [weak self] in self?.window?.close() },
-            save: { [weak self] in self?.save() }))
+            save: { [weak self] in self?.save() },
+            useGuidedSamples: { [weak self] in
+                self?.poseMode = .guided
+                self?.restart()
+            }))
         window.center()
         self.window = window
         manager.cameraWindowOpen = true
@@ -65,7 +74,7 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
                 return
             }
         }
-        let pipeline = RecognitionPipeline(mode: mode, profile: manager.profile)
+        let pipeline = RecognitionPipeline(mode: mode, profile: manager.profile, poseMode: poseMode)
         camera.start(pipeline: pipeline, timeout: mode == .verify ? 20 : 90)
     }
 

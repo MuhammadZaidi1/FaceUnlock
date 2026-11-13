@@ -32,7 +32,7 @@ final class PreviewView: NSView {
     func updateMirroring() {
         if let connection = previewLayer.connection, connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = true
+            connection.isVideoMirrored = CameraCoordinates.previewMirrored
         }
     }
 
