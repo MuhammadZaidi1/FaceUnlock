@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var appState: AppState
+    let openEnrollment: () -> Void
     @State private var placeholder: Placeholder?
 
     var body: some View {
@@ -29,7 +30,7 @@ struct MenuBarView: View {
             Divider()
 
             VStack(spacing: 8) {
-                Button { placeholder = .enrollment } label: {
+                Button(action: openEnrollment) {
                     Label("Enroll Face…", systemImage: "person.crop.square")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -59,14 +60,11 @@ struct MenuBarView: View {
 }
 
 private enum Placeholder: String, Identifiable {
-    case enrollment
     case settings
 
     var id: String { rawValue }
-    var title: String { self == .enrollment ? "Enroll Face" : "Settings" }
+    var title: String { "Settings" }
     var message: String {
-        self == .enrollment
-            ? "Face enrollment will be available in a future version. No camera access or biometric data collection occurs."
-            : "Settings will be available in a future version. The enable preference is saved automatically."
+        "Settings will be available in a future version. The enable preference is saved automatically."
     }
 }
