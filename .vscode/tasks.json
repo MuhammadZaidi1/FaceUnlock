@@ -1,0 +1,28 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "swift: build",
+      "type": "process",
+      "command": "swift",
+      "args": ["build"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": "$swiftc"
+    },
+    {
+      "label": "FaceUnlock: package app",
+      "type": "process",
+      "command": "bash",
+      "args": ["scripts/package-app.sh", "debug"],
+      "problemMatcher": "$swiftc"
+    },
+    {
+      "label": "FaceUnlock: run app",
+      "type": "process",
+      "command": "open",
+      "args": ["dist/FaceUnlock.app"],
+      "dependsOn": "FaceUnlock: package app",
+      "problemMatcher": []
+    }
+  ]
+}
