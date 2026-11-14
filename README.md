@@ -2,13 +2,138 @@
 
 A native SwiftUI menu-bar-only macOS application scaffold. Requires macOS 13 or later; the packaging script targets Apple Silicon (`arm64`). Uses `MenuBarExtra` with the SF Symbol `faceid` and a compact native popover. The packaged app has `LSUIElement = true`, so it has no Dock icon. A temporary setup window opens only when requested.
 
-**Current safety status: a real different person was falsely accepted. Positive identity acceptance is disabled in v0.3.2 pending real-person validation; threshold passes report Inconclusive.**
+**Current safety status: a real different person was falsely accepted. Positive identity acceptance is disabled since v0.3.2 pending real-person validation; threshold passes report Inconclusive.**
 
 Phase 3 adds one-person enrollment and live identity comparison using a genuine pretrained SFace model running locally through Core ML. Vision supplies face landmarks and quality signals; it is not the identity model. A temporary window collects six samples or performs verification, then stops capture. The menu shows enrollment status, Enroll/Replace, Verify, Delete with confirmation, Settings, and Quit.
 
 **Prototype only: no reliable anti-spoofing and not suitable for security-critical authentication.** A photograph or screen replay may match. FaceUnlock does not unlock macOS, enter passwords, install login hooks, request administrator privileges, or modify authentication. The Enable switch remains a saved preference only and never starts a background camera session.
 
-## v0.3.2 — confirmed false acceptance; identity acceptance disabled
+## v0.3.3 — developer recognition evaluation
+
+**Positive identity acceptance remains disabled. The production threshold remains 0.363.** This release adds an opt-in measurement tool, not an authentication decision or a threshold recommendation. It does not resolve the confirmed real-person false acceptance from v0.3.2.
+
+### Launch from VS Code or Terminal
+
+Quit any running FaceUnlock instance before packaging or changing launch flags. In VS Code choose **Terminal → Run Task… → FaceUnlock: run recognition evaluation**. The new task packages the debug `.app` and opens it with the evaluation flag. Use this task or the bundled launch commands rather than an unbundled Swift Package F5 launch, so camera permission metadata and `LSUIElement` are present.
+
+Equivalent commands from the repository root:
+
+```sh
+bash scripts/package-app.sh debug
+open dist/FaceUnlock.app --args --recognition-evaluation
+```
+
+For a release build:
+
+```sh
+bash scripts/package-app.sh release
+open dist/FaceUnlock.app --args --recognition-evaluation
+```
+
+Click the face menu-bar icon and choose **Evaluate Recognition…**. The action is absent without `--recognition-evaluation`, and the window controller also checks the flag. `open` does not replace arguments in an already-running process, so quit the previous instance first. Do not use `open -n` to create overlapping copies. Normal launch remains `open dist/FaceUnlock.app` and has no evaluation action. Existing `--recognition-diagnostics` and `--enrollment-diagnostics` flags remain independent; add them only if those separate diagnostic panels are wanted.
+
+### Troubleshooting a missing Evaluate Recognition action
+
+The action is implemented in `MenuBarView.swift` and connected by `FaceUnlockApp.swift` to `EnrollmentWindowController.evaluate()`, which opens the existing 15-comparison evaluation mode. Both menu visibility and the window action require the **exact** argument `--recognition-evaluation`. `--recognition-diagnostics` and `--enrollment-diagnostics` do not enable this menu action. Loading/Keychain activity or an already-open camera window disables the entry; those states do not hide it.
+
+Investigation found two local copies: the workspace `dist/FaceUnlock.app` declared **0.3.3**, whereas `/Applications/FaceUnlock.app` declared **0.1.0** and contained a different executable. No app process was running during the initial inspection, so the precise path/arguments of the previously observed popover could not be recovered. Launching by name, Spotlight, or an old shortcut can choose the installed copy. The installed copy has not been replaced or modified. After rebuilding, the running process was verified as the workspace `dist` executable with `--recognition-evaluation`; all 53 tests and release bundle/model checks passed. Native UI inspection timed out, so the final menu click remains a manual check.
+
+1. Quit **every running FaceUnlock copy** through its menu. Close any active camera window first. Passing `open --args` to an already-running app does not replace that process's startup arguments.
+2. From the project folder, rebuild and launch the exact workspace bundle:
+
+   ```sh
+   cd /Users/muhammadabbas/Documents/FaceUnlock
+   bash scripts/package-app.sh release
+   open /Users/muhammadabbas/Documents/FaceUnlock/dist/FaceUnlock.app --args --recognition-evaluation
+   ```
+
+3. Click the face icon. **Evaluate Recognition…** should appear immediately below **Verify Face…**. Wait for Keychain loading to finish and close another camera window if the action is disabled. Choose it to open evaluation; no camera starts merely from launching the menu-bar app.
+4. If it is still missing, inspect the running command and bundle metadata:
+
+   ```sh
+   pgrep -fl 'FaceUnlock.app/Contents/MacOS/FaceUnlock'
+   /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Users/muhammadabbas/Documents/FaceUnlock/dist/FaceUnlock.app/Contents/Info.plist
+   ```
+
+   The process must point to the workspace `dist` executable and include `--recognition-evaluation`; metadata must report **0.3.3**. Do not use `open -a FaceUnlock`, the old Applications shortcut, or `open -n`. In VS Code use **FaceUnlock: run recognition evaluation**, after quitting the existing instance; **FaceUnlock: run app** deliberately launches without the developer flag.
+
+This procedure does not reset enrollment or camera permissions, change Keychain data, alter the 0.363 verification threshold, or enable positive identity acceptance.
+
+### Attempt lifecycle and privacy
+
+Evaluation reuses the same single temporary window/camera owner as enrollment and verification. It re-reads and validates the enrolled Keychain profile, loads the existing verified SFace model, and uses the unchanged Vision, pose, face-size, capture-quality, landmark alignment, lighting, blur, RGB, tensor/output, and cosine checks. Exactly one face is required. Evaluation never enrolls, replaces, deletes, or relabels an identity and never writes a score to Keychain or UserDefaults.
+
+One attempt collects **exactly 15 valid comparisons**. It does not stop after three threshold passes. Distinct, finite, strictly increasing capture presentation timestamps are required; accepted comparisons are at least **0.5 seconds** apart. Camera analysis is throttled to roughly two frames per second. The developer must hold the test condition constant and use one consenting participant per attempt. The optional label is just a window-local description such as “With glasses”; it is never interpreted as identity, genuine/impostor ground truth, or an accuracy label.
+
+A **45-second** deadline starts when the camera worker begins the attempt, including model preparation/permission waiting. It excludes the preceding Keychain read. Duration uses a monotonic clock through comparison completion or termination, so it includes processing time. The capture timer also ends an attempt if no useful frames arrive. A busy framework call may delay its queued shutdown until that call returns; the deadline is not a hard real-time preemption guarantee.
+
+On 15 valid comparisons, an error, timeout, Cancel, Done, close, or app shutdown, capture stops and queued results cannot restart the closed presentation. A timeout/failure may show **partial** statistics, explicitly distinct from a completed 15/15 evaluation. Cancel/Done/red close dismiss and discard results. Retry clears results, rejection counts, label, and custom threshold, fully stops/removes camera inputs/outputs, re-reads Keychain, creates a fresh processing pipeline and cancellation generation, resets frame counters, and starts a new capture run. Delegate callbacks from an old capture output are ignored even if they arrive after the next run starts. The shared `AVCaptureSession` object is reused after teardown; capture inputs and outputs are rebuilt. A second menu action cannot start a simultaneous camera session.
+
+The optional label and custom threshold live only in SwiftUI state. Evaluation windows disable macOS window restoration and release their content on close. Raw images, frames, full model inputs, embeddings, templates, and biometric-derived scores are never logged, recorded, uploaded, exported or written to disk by this feature. At most 15 scores and bounded scalar rejection/streak events are held in process memory; the camera/view references are cleared on close. This is application-level disposal, not a claim of secure memory zeroization. There is no result history or export action. Normal verification's five-second retry delay and three-attempts-per-minute limiter are unchanged; evaluation uses its separate bounded, explicitly started attempt lifecycle and does not consume or reset that limiter.
+
+### Statistics and experimental thresholds
+
+The window contains a live preview, 0/15→15/15 progress, current quality/status guidance, latest comparison score, statistics, experimental threshold analysis, and a pinned Cancel/Retry/Done footer. Content scrolls vertically in a resizable 420…560-point-wide window; text wraps. Completed capture is visibly marked stopped. Additional threshold inspection is local to the current evaluation and never writes to `VerificationPolicy`.
+
+Statistics include min, max, arithmetic mean, median, **population** standard deviation (`sqrt(sum((x−mean)^2)/N)`), valid count, rejected analyzed-frame count, rejection-reason counts, and duration. Even-size partial medians average the two middle sorted values; zero valid comparisons have no similarity statistics rather than fabricated zero similarity. The final duration stays fixed after capture stops.
+
+“Rejected frames” means frames actually analyzed at the throttled cadence that failed freshness, timing, or quality/recognition gates. Higher-rate camera frames skipped only for sampling cadence are not counted as quality rejections. A session interruption is a sequence break, not a rejected camera frame. Fatal failure before a frame exists (for example camera denial or model load failure) has no rejected-frame count; the main status shows the error. Failed analyzed frames and their reasons are counted without accepting a comparison.
+
+Candidates **0.363**, **0.500**, **0.600**, and **0.700** show `score >= threshold` count, percentage of valid comparisons passing, and whether any three consecutive comparisons in that attempt would have passed. Rejected analyzed frames, interruptions and gaps over two seconds break the hypothetical streak. Earlier three-pass runs remain counted even if a later rejection occurs, because ordinary verification would already have ended at that earlier point. With zero comparisons the percentage is displayed as unavailable. These percentages are not probabilities, accuracy, confidence, or false-accept rates; nearby video frames are correlated.
+
+Use **Inspect another experimental threshold** to enter one finite value in **[−1,1]** using a decimal point, then click Inspect or press Return in that field. The custom candidate is added to the comparison list (duplicates are merged); inspecting another value replaces that custom candidate. Invalid/NaN/infinite values show an error. All results are labeled **Experimental — not an authentication decision**. Nothing automatically selects a cutoff or re-enables acceptance. Normal Verify still ends as **Inconclusive** after three threshold passes, as No match after its normal comparison/deadline limits, or with an error; its behavior has not been replaced by evaluation.
+
+### Files and architecture
+
+New files:
+
+- `Sources/RecognitionCore/RecognitionEvaluation.swift`: transient score/event accumulator, exact 15-comparison completion, timing/freshness guards, statistical summaries, and pure experimental threshold simulation. Types intentionally have no Codable/storage/export interface.
+- `Sources/FaceUnlock/EvaluationView.swift`: temporary evaluation UI and reusable results summary; window-local label and custom threshold; no identity inference from labels.
+- `Sources/FaceUnlock/DeveloperFeatures.swift`: explicit command-line gate for the action and window.
+- `Tests/RecognitionCoreTests/RecognitionEvaluationTests.swift`: statistics, threshold boundaries/counts, sequence breaks, cadence, timestamps, timeout/failure and fresh-state tests.
+- `Tests/RecognitionCoreTests/EvaluationPipelineTests.swift`: real pipeline interface with test-only model doubles; 15/15 completion, rejection/error handling, missing/corrupt enrollment, unchanged Verify decisions, retry/cancellation and idle camera cleanup.
+- `Tests/RecognitionCoreTests/EvaluationLayoutTests.swift`: camera-free light/dark evaluation/results layout checks using synthetic scores and test-only storage.
+
+Modified files: `RecognitionPipeline.swift` adds an isolated evaluate mode after the shared quality/model path; `CameraController.swift` publishes transient evaluation snapshots and tears down on terminal outcomes; `EnrollmentWindowController.swift` owns the third mode in its existing one-window lifecycle; `MenuBarView.swift` and `FaceUnlockApp.swift` connect the gated action; `.vscode/tasks.json` supplies the bundled debug launch task; `Resources/Info.plist` becomes version **0.3.3**, build **6**; this README documents operation and limits. The model asset bytes, preprocessing version, Keychain schema, enrollment transaction, production verification policy, normal rate limits, camera privacy description, LSUIElement, and packaging script remain unchanged.
+
+### Automated validation
+
+Run the requested checks from the repository root:
+
+```sh
+bash scripts/test.sh
+swift run --arch arm64 ModelCheck
+bash scripts/package-app.sh debug
+bash scripts/package-app.sh release
+bash scripts/validate-app.sh
+```
+
+All five commands above passed on this Apple Silicon machine. The packaged release also launched successfully with the evaluation flag, and macOS reported accessory activation policy (no Dock application icon). `LSUIElement`, camera metadata, arm64 architecture, signature and bundled real model validation passed.
+
+The suite now contains **53 tests**, including every previous regression and the new evaluation statistics/pipeline/layout tests. Pure statistics tests use known synthetic values (including negative cosine values and odd/even median cases). Test-only model embeddings never substitute for production inference. The real checkpoint is exercised separately by ModelCheck and the packaged-resource validator using synthetic **non-face** inputs. Those checks establish numerical execution/resource integrity, not identity accuracy or calibration.
+
+Camera-free synthetic light/dark layouts were rendered and visually inspected at 420-point width. At minimum window height the content is scrollable and Cancel/Retry/Done remain visible. Completed/partial summary labels, threshold rows, custom candidate and non-authentication warnings were inspected. Optional regeneration uses **synthetic test data only**, briefly shows test windows, and never captures a webcam:
+
+```sh
+FACEUNLOCK_EVALUATION_LAYOUT_SNAPSHOTS=/tmp/faceunlock-v033-layout bash scripts/test.sh
+```
+
+Live 15-frame completion, the actual camera indicator clearing, permission/disconnection/sleep behavior, real Keychain prompts, menu-bar icon interactions/visual appearance, labels and field interactions, and scores for real participants still require on-device verification. Empty-session shutdown tests are not claimed as active-camera hardware tests. No people's images or evaluation scores were gathered for automated validation.
+
+### Manual MacBook test plan
+
+1. Quit any previous build; launch with the evaluation flag. Confirm one `faceid` menu icon, no Dock icon, the new action only with the flag, and a compact menu. On a normal launch confirm Evaluate Recognition is absent. Choose Evaluate without enrollment or with denied/unreadable Keychain access: show a clear error and do not start capture.
+2. With enrollment available, establish the condition **before** opening Evaluate. Choose a neutral optional label. In good light, hold still; confirm 1/15 through 15/15, continued collection past three threshold passes, and no authentication success message. The camera must stop at completion. Inspect statistics and expand rejected reasons. Do not interpret a high pass fraction as verified identity.
+3. Try the four candidates and an additional value (such as 0.65). Confirm the displayed candidate counts/percentages change without modifying 0.363, enrollment or normal Verify. Invalid values should show an error. No export/save action should exist.
+4. Use Retry for each new condition/person: confirm 0/15, empty label/custom field, empty prior results and fresh capture counters before new comparisons arrive. Test the enrolled person with/without glasses, different light, slight angles within existing pose limits, and distances large enough to pass the existing face-size gate. For different participants obtain consent and use a separate attempt; the label does not define ground truth. Keep the condition stable for each attempt. Results exist only in the current window; there is no cross-attempt history.
+5. Obscure/blur/darken the view, move too far away or include two faces. Valid count must not increase from rejected frames, latest score must clear, and rejection reasons/counts must update. Restore a valid condition to resume. Keep the view unusable long enough to reach the 45-second deadline; confirm partial, not completed, results and camera shutdown.
+6. Cancel, Done, red close, unplug a USB camera, and quit during collection. Confirm capture stops, no result/profile is saved and no closed window restarts after a permission reply. Reopen: there must be no previous scores/label. A model/device failure should stop the attempt with a clear error/partial state. Test closing during a Keychain read; any later read completion must not open a camera.
+7. Try other menu camera actions while the window is open: no overlapping capture may start. Close evaluation and verify normal enrollment, replacement cancellation, confirmed deletion and Verify still work as before. Normal Verify must retain its existing retry limits and Inconclusive result for threshold passes.
+8. Resize to minimum width/height in both macOS light and dark appearance. Scroll to all statistics/threshold controls, verify no horizontal scrolling or ellipsized status text, and confirm Cancel/Retry/Done remain reachable.
+
+Known limitations: one active attempt only; no saved datasets, export, participant identity/ground-truth inference, threshold recommendation, cross-condition comparison history, or reliable anti-spoofing. Fifteen correlated frames and a few participants cannot establish security or a false-accept rate. The prior real-person false acceptance remains unresolved; use this feature to inspect behavior while all positive identity authentication remains disabled.
+
+## v0.3.2 — confirmed false acceptance; identity acceptance disabled (historical audit)
 
 The user confirmed that their enrolled face **and another real person** both received Match in **separate verification attempts**. This is a genuine false acceptance, not explained by re-reading the first completed result. **The live root cause remains unresolved. Do not use this system for authentication.** No consented face-image test set was supplied for this investigation, and no personal images were downloaded, collected, saved, or used by the automated checks.
 
@@ -330,4 +455,4 @@ No Keychain item or camera decision is reset automatically by the tests or build
 
 ## Validation record
 
-Automated validation on this Apple Silicon machine: 40 Swift Testing unit/pipeline/manager/layout tests; real Python Core ML versus ONNX parity on four synthetic inputs; real Swift Core ML inference and pixel-orientation checks; debug/release arm64 builds and packaging; signature/plist/model-resource checks; missing-model/corrupt-manifest failure checks; and a release launch/process smoke check. No actual face enrollment, live identity result, macOS Keychain authorization/persistence, or anti-spoofing result is claimed from these checks. Full Xcode is optional for app builds with the installed working Command Line Tools; use the toolchain instructions above if your SDK differs.
+Automated validation on this Apple Silicon machine: 53 Swift Testing unit/pipeline/manager/layout tests; real Python Core ML versus ONNX parity on four synthetic inputs; real Swift Core ML inference and pixel-orientation checks; debug/release arm64 builds and packaging; signature/plist/model-resource checks; missing-model/corrupt-manifest failure checks; and a release launch/process smoke check. No actual face enrollment, live identity result, macOS Keychain authorization/persistence, or anti-spoofing result is claimed from these checks. Full Xcode is optional for app builds with the installed working Command Line Tools; use the toolchain instructions above if your SDK differs.

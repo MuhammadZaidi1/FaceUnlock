@@ -6,6 +6,7 @@ struct MenuBarView: View {
     @ObservedObject var enrollment: EnrollmentManager
     let verify: () -> Void
     let openEnrollment: () -> Void
+    let evaluate: () -> Void
     @State private var confirmDeletion = false
     @State private var placeholder: Placeholder?
 
@@ -44,6 +45,13 @@ struct MenuBarView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .disabled(enrollment.busy || enrollment.cameraWindowOpen)
+                if DeveloperFeatures.recognitionEvaluation {
+                    Button(action: evaluate) {
+                        Label("Evaluate Recognition…", systemImage: "chart.bar")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .disabled(enrollment.busy || enrollment.cameraWindowOpen)
+                }
                 Button(role: .destructive) { confirmDeletion = true } label: {
                     Label("Delete Enrollment…", systemImage: "trash")
                         .frame(maxWidth: .infinity, alignment: .leading)

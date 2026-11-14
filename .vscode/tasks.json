@@ -23,6 +23,14 @@
       "args": ["dist/FaceUnlock.app"],
       "dependsOn": "FaceUnlock: package app",
       "problemMatcher": []
+    },
+    {
+      "label": "FaceUnlock: run recognition evaluation",
+      "type": "process",
+      "command": "open",
+      "args": ["dist/FaceUnlock.app", "--args", "--recognition-evaluation"],
+      "dependsOn": "FaceUnlock: package app",
+      "problemMatcher": []
     }
   ]
 }

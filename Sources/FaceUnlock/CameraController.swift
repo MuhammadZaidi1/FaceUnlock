@@ -18,6 +18,8 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
 
     @Published private(set) var recognitionDiagnostics: RecognitionDiagnostics?
 
+    @Published private(set) var evaluation: EvaluationSnapshot?
+
     let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.faceunlock.camera", qos: .userInitiated)
     private var presentationID: UUID?
@@ -63,11 +65,13 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         let cancellation = CaptureCancellation()
         presentationCancellation = cancellation
         let id = UUID()
+        let sessionTimeout = pipeline?.isEvaluation == true ? min(timeout, RecognitionEvaluation.timeout) : timeout
         presentationID = id
         completed = false
         candidate = nil
         diagnostics = nil
         recognitionDiagnostics = nil
+        evaluation = nil
         message = "Checking camera permission…"
         faceCount = 0
         isStreaming = false
@@ -78,12 +82,14 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
             self.activeCancellation = cancellation
             self.activeID = id
             self.pipeline = pipeline
-            self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            pipeline?.beginEvaluation(at: ProcessInfo.processInfo.systemUptime, clock: { ProcessInfo.processInfo.systemUptime })
+            self.queue.asyncAfter(deadline: .now() + sessionTimeout) { [weak self] in
                 guard let self, self.activeID == id else { return }
+                let evaluation = self.pipeline?.finishEvaluation(.timedOut, at: ProcessInfo.processInfo.systemUptime)
                 self.activeID = nil
                 self.tearDown()
                 self.pipeline = nil
-                self.publish(id, "Camera session timed out. Close or retry.", complete: true)
+                self.publish(id, evaluation == nil ? "Camera session timed out. Close or retry." : "Evaluation timed out. Partial results only; close or retry.", complete: true, evaluation: evaluation)
             }
             do {
                 if let pipeline {
@@ -91,9 +97,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
                     try pipeline.prepare()
                 }
             } catch {
-                self.activeID = nil
-                self.pipeline = nil
-                self.publish(id, "Error: \(error.localizedDescription)", complete: true)
+                self.fail(id, "Error: \(error.localizedDescription)")
                 return
             }
             guard !cancellation.isCancelled else { return }
@@ -127,6 +131,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         presentationID = nil
         diagnostics = nil
         recognitionDiagnostics = nil
+        evaluation = nil
         candidate = nil
         completed = false
         faceCount = 0
@@ -223,12 +228,12 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
         switch name {
         case AVCaptureSession.wasInterruptedNotification:
             interrupted = true
-            publish(id, "Camera interrupted. Waiting for it to become available…")
+            publish(id, "Camera interrupted. Waiting for it to become available…", evaluation: pipeline?.evaluationSnapshot(at: ProcessInfo.processInfo.systemUptime))
         case AVCaptureSession.interruptionEndedNotification:
             interrupted = false
             // AVFoundation normally resumes automatically; restart only if needed.
             if !session.isRunning { session.startRunning() }
-            publish(id, "Resuming camera…")
+            publish(id, "Resuming camera…", evaluation: pipeline?.evaluationSnapshot(at: ProcessInfo.processInfo.systemUptime))
         case AVCaptureSession.runtimeErrorNotification:
             fail(id, "Camera error: \(error ?? "Capture stopped"). Choose Retry to reconnect.")
         case AVCaptureSession.didStopRunningNotification:
@@ -238,10 +243,18 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let id = activeID, activeCancellation?.isCancelled == false, session.isRunning, !interrupted else { return }
+        guard let id = activeID, activeCancellation?.isCancelled == false, session.isRunning, !interrupted,
+              session.outputs.contains(where: { $0 === output }) else { return }
+        // Ignore any already-queued delegate callback from a previous capture run's output.
         let now = ProcessInfo.processInfo.systemUptime
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        guard timestamp.isFinite, timestamp > lastFrameTimestamp else { return }
+        guard timestamp.isFinite, timestamp > lastFrameTimestamp else {
+            if let pipeline, pipeline.isEvaluation, now - lastDetectionTime >= 0.5 {
+                lastDetectionTime = now
+                apply(pipeline.rejectEvaluationFrame("Repeated, invalid, or out-of-order capture timestamp", at: now), id: id)
+            }
+            return
+        }
         lastFrameTimestamp = timestamp
         guard now - lastDetectionTime >= (pipeline == nil ? 0.2 : 0.5) else { return }
         lastDetectionTime = now
@@ -267,33 +280,38 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
                     } : nil
                     let result = pipeline.process(buffer, faces: detected.count == 1 ? (request.results ?? []) : detected,
                         quality: quality.results?.first?.faceCaptureQuality, timestamp: now, detectorPose: pose, frameTimestamp: timestamp)
-                    if result.complete {
-                        activeID = nil
-                        self.pipeline = nil
-                        tearDown()
-                    }
-                    publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete, candidate: result.candidate, diagnostics: result.diagnostics, recognitionDiagnostics: result.recognitionDiagnostics)
+                    apply(result, id: id, count: count)
                     return
                 }
                 publish(id, count == 0 ? "No face detected" : (count == 1 ? "Face detected" : "\(count) faces detected"), count: count, streaming: true)
             } catch {
-                activeID = nil
-                pipeline = nil
-                tearDown()
-                publish(id, "Error: face analysis unavailable. Close and retry.", complete: true)
+                if let pipeline, pipeline.isEvaluation { _ = pipeline.rejectEvaluationFrame("Face analysis failed", at: ProcessInfo.processInfo.systemUptime) }
+                fail(id, "Error: face analysis unavailable. Close and retry.")
             }
         }
     }
 
+    private func apply(_ result: RecognitionFrameResult, id: UUID, count: Int = 0) {
+        if result.complete {
+            activeID = nil
+            pipeline = nil
+            tearDown()
+        }
+        publish(id, result.text, count: count, streaming: !result.complete, complete: result.complete,
+            candidate: result.candidate, diagnostics: result.diagnostics,
+            recognitionDiagnostics: result.recognitionDiagnostics, evaluation: result.evaluation)
+    }
+
     private func fail(_ id: UUID, _ text: String, denied: Bool = false) {
         guard activeID == id else { return }
+        let evaluation = pipeline?.finishEvaluation(.failed, at: ProcessInfo.processInfo.systemUptime)
         activeID = nil
         pipeline = nil
         tearDown()
-        publish(id, text, denied: denied, complete: true)
+        publish(id, text, denied: denied, complete: true, evaluation: evaluation)
     }
 
-    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil, diagnostics: EnrollmentDiagnostics? = nil, recognitionDiagnostics: RecognitionDiagnostics? = nil) {
+    private func publish(_ id: UUID, _ text: String, count: Int = 0, streaming: Bool = false, denied: Bool = false, complete: Bool = false, candidate: EnrollmentProfile? = nil, diagnostics: EnrollmentDiagnostics? = nil, recognitionDiagnostics: RecognitionDiagnostics? = nil, evaluation: EvaluationSnapshot? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.presentationID == id else { return }
             self.message = text
@@ -303,6 +321,7 @@ final class CameraController: NSObject, ObservableObject, AVCaptureVideoDataOutp
             self.completed = complete
             self.candidate = candidate
             if let diagnostics { self.diagnostics = diagnostics }
+            if let evaluation { self.evaluation = evaluation }
             self.recognitionDiagnostics = CommandLine.arguments.contains("--recognition-diagnostics") ? recognitionDiagnostics : nil
         }
     }

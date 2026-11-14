@@ -15,6 +15,10 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
 
     func show() { show(mode: .enroll) }
     func verify() { show(mode: .verify) }
+    func evaluate() {
+        guard DeveloperFeatures.recognitionEvaluation else { return }
+        show(mode: .evaluate)
+    }
 
     private func show(mode: RecognitionMode) {
         if let window {
@@ -27,19 +31,25 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
         poseMode = .validated
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: min(640, (NSScreen.main?.visibleFrame.height ?? 800) - 80)),
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.title = mode == .enroll ? "FaceUnlock Enrollment" : "FaceUnlock Verification"
+        window.title = mode == .enroll ? "FaceUnlock Enrollment" : (mode == .verify ? "FaceUnlock Verification" : "FaceUnlock Evaluation")
         window.contentMinSize = NSSize(width: 420, height: 420)
         window.contentMaxSize = NSSize(width: 560, height: 1000)
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: EnrollmentView(camera: camera, manager: manager, mode: mode,
-            retry: { [weak self] in self?.restart() },
-            close: { [weak self] in self?.window?.close() },
-            save: { [weak self] in self?.save() },
-            useGuidedSamples: { [weak self] in
-                self?.poseMode = .guided
-                self?.restart()
-            }))
+        if mode == .evaluate {
+            window.isRestorable = false
+            window.contentView = NSHostingView(rootView: EvaluationView(camera: camera, manager: manager,
+                retry: { [weak self] in self?.restart() }, close: { [weak self] in self?.window?.close() }))
+        } else {
+            window.contentView = NSHostingView(rootView: EnrollmentView(camera: camera, manager: manager, mode: mode,
+                retry: { [weak self] in self?.restart() },
+                close: { [weak self] in self?.window?.close() },
+                save: { [weak self] in self?.save() },
+                useGuidedSamples: { [weak self] in
+                    self?.poseMode = .guided
+                    self?.restart()
+                }))
+        }
         window.center()
         self.window = window
         manager.cameraWindowOpen = true
@@ -51,7 +61,7 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
     private func restart() {
         guard !manager.busy else { return }
         camera.stop(wait: true)
-        if mode == .verify {
+        if mode != .enroll {
             // Re-read for every attempt: a cached profile must not conceal denied,
             // locked, deleted, corrupt, or incompatible Keychain data.
             manager.reload { [weak self] in self?.beginCapture() }
@@ -62,20 +72,20 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
 
     private func beginCapture() {
         guard window != nil, !manager.busy else { return }
-        if mode == .verify {
+        if mode != .enroll {
             guard let profile = manager.profile, !manager.storageFailed else {
                 camera.report(manager.storageFailed ? "Error: \(manager.status)" : "No enrollment. Enroll a face first.")
                 return
             }
             do { try profile.validate(for: .sface) }
             catch { camera.report(error.localizedDescription); return }
-            guard manager.permitVerification() else {
+            guard mode != .verify || manager.permitVerification() else {
                 camera.report("Retry delay active. Wait at least 5 seconds; at most 3 attempts per minute.")
                 return
             }
         }
         let pipeline = RecognitionPipeline(mode: mode, profile: manager.profile, poseMode: poseMode)
-        camera.start(pipeline: pipeline, timeout: mode == .verify ? 20 : 90)
+        camera.start(pipeline: pipeline, timeout: mode.timeout)
     }
 
     private func save() {
@@ -85,12 +95,13 @@ final class EnrollmentWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool { !manager.busy }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { mode == .evaluate || !manager.busy }
 
     func windowWillClose(_ notification: Notification) {
         camera.stop(wait: true)
         if mode == .verify { manager.finishVerification() }
         manager.cameraWindowOpen = false
+        if mode == .evaluate { window?.contentView = nil } // release label/custom threshold state even if AppKit retains the closed window
         window = nil
     }
 

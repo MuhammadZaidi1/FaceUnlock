@@ -4,21 +4,30 @@ import Vision
 import FaceModel
 
 struct RecognitionFrameResult {
-    let text: String
+    var text: String
     var complete = false
     var candidate: EnrollmentProfile?
     var diagnostics: EnrollmentDiagnostics?
     var rejection: String?
     var recognitionDiagnostics: RecognitionDiagnostics?
+    var evaluation: EvaluationSnapshot?
 }
 
-enum RecognitionMode { case enroll, verify }
+enum RecognitionMode {
+    case enroll, verify, evaluate
+    var timeout: TimeInterval {
+        switch self { case .enroll: return 90; case .verify: return 20; case .evaluate: return RecognitionEvaluation.timeout }
+    }
+}
 
 /// Used exclusively on the camera queue. Production has only the real SFace implementation.
 final class RecognitionPipeline {
     private let mode: RecognitionMode
     private let profile: EnrollmentProfile?
     private let model: FaceEmbeddingModel
+    private var evaluationClock: (() -> TimeInterval)?
+    private var evaluation = RecognitionEvaluation()
+    var isEvaluation: Bool { mode == .evaluate }
     private var enrollment = EnrollmentTransaction()
     private var verification = VerificationAccumulator()
     private var startedAt: TimeInterval?
@@ -27,6 +36,7 @@ final class RecognitionPipeline {
     private var processedFrames = 0
     private var poseRejections = 0
     private var freshFrames = FreshFrameGate()
+    private var processingTime: TimeInterval = 0
     private var lastFrameTime: TimeInterval?
     private var currentScore: Double?
     private var freshFrame = false
@@ -43,7 +53,46 @@ final class RecognitionPipeline {
     }
 
     func prepare() throws { try model.prepare() }
-    func interrupt() { verification.resetStreak() }
+    func beginEvaluation(at now: TimeInterval, clock: (() -> TimeInterval)? = nil) {
+        if isEvaluation { evaluationClock = clock; evaluation.begin(at: now) }
+    }
+    func interrupt() { verification.resetStreak(); if isEvaluation { evaluation.breakSequence() } }
+
+    func evaluationSnapshot(at now: TimeInterval) -> EvaluationSnapshot? {
+        isEvaluation ? evaluation.snapshot(at: now) : nil
+    }
+
+    func finishEvaluation(_ phase: EvaluationPhase, at now: TimeInterval) -> EvaluationSnapshot? {
+        guard isEvaluation else { return nil }
+        evaluation.finish(phase, at: now)
+        return evaluation.snapshot(at: now)
+    }
+
+    func rejectEvaluationFrame(_ reason: String, at now: TimeInterval) -> RecognitionFrameResult {
+        processingTime = now
+        return finalizeEvaluation(reject(reason), at: now)
+    }
+
+    private func finalizeEvaluation(_ original: RecognitionFrameResult, at now: TimeInterval) -> RecognitionFrameResult {
+        guard isEvaluation else { return original }
+        var result = original
+        _ = evaluation.expire(at: now)
+        if original.complete && evaluation.phase == .collecting {
+            evaluation.reject(original.rejection ?? original.text, at: now)
+            evaluation.finish(.failed, at: now)
+        }
+        result.evaluation = evaluation.snapshot(at: now)
+        switch evaluation.phase {
+        case .collecting: break
+        case .completed: result = RecognitionFrameResult(text: "Evaluation complete: 15/15 comparisons. Experimental — not an authentication decision.", complete: true, evaluation: result.evaluation)
+        case .timedOut: result.text = "Evaluation timed out. Partial results only; no authentication decision."; result.complete = true
+        case .failed:
+            if !original.complete { result.text = "Evaluation failed. Partial results only; close or retry." }
+            result.complete = true
+        }
+        if result.complete { terminalResult = result }
+        return result
+    }
 
     func process(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval, detectorPose: FacePose? = nil, frameTimestamp: TimeInterval? = nil) -> RecognitionFrameResult {
         if var terminal = terminalResult {
@@ -52,6 +101,7 @@ final class RecognitionPipeline {
             terminal.recognitionDiagnostics?.passedThreshold = nil
             return terminal
         }
+        processingTime = isEvaluation ? (evaluationClock?() ?? timestamp) : timestamp
         didInvokeModel = false
         currentScore = nil
         currentFrameTimestamp = frameTimestamp ?? timestamp
@@ -60,7 +110,9 @@ final class RecognitionPipeline {
         let face = faces.count == 1 ? faces.first : nil
         let pose = detectorPose ?? FacePose(yaw: face?.yaw?.doubleValue, pitch: face?.pitch?.doubleValue, roll: face?.roll?.doubleValue)
         var result: RecognitionFrameResult
-        if !freshFrame {
+        if isEvaluation && evaluation.expire(at: processingTime) {
+            result = RecognitionFrameResult(text: "Evaluation timed out.", complete: true)
+        } else if !freshFrame {
             result = reject("Waiting for a fresh camera frame; repeated or out-of-order frame rejected.")
         } else {
             if let lastFrameTime, timestamp - lastFrameTime > 2 { verification.resetStreak() }
@@ -81,6 +133,7 @@ final class RecognitionPipeline {
                 processedFrames: processedFrames, processedAt: timestamp, poseMode: poseMode,
                 canOfferGuided: faces.count == 1 && (quality ?? 0) >= 0.4 && (pose.yaw == nil || poseRejections >= 6))
         }
+        if isEvaluation { result = finalizeEvaluation(result, at: evaluationClock?() ?? timestamp) }
         if result.complete { terminalResult = result }
         return result
     }
@@ -88,7 +141,7 @@ final class RecognitionPipeline {
     private func processFrame(_ buffer: CVPixelBuffer, faces: [VNFaceObservation], quality: Float?, timestamp: TimeInterval, pose: FacePose) -> RecognitionFrameResult {
         if startedAt == nil { startedAt = timestamp }
         let duration = timestamp - (startedAt ?? timestamp)
-        if duration > (mode == .verify ? 20 : 90) {
+        if duration > mode.timeout {
             return RecognitionFrameResult(text: mode == .verify ? "No match — verification timed out." : "Enrollment timed out. Existing enrollment is unchanged.", complete: true)
         }
         guard faces.count == 1, let face = faces.first else {
@@ -96,7 +149,7 @@ final class RecognitionPipeline {
             return reject(faces.isEmpty ? "Looking for face" : "Only one face can be visible.")
         }
         do {
-            if mode == .verify {
+            if mode != .enroll {
                 guard let profile else { throw RecognitionError.noEnrollment }
                 try profile.validate(for: .sface)
             }
@@ -129,13 +182,17 @@ final class RecognitionPipeline {
                     return RecognitionFrameResult(text: poseMode == .guided ? "6 of 6 quality samples ready. Head turns were NOT validated. Save or Cancel." : "6 of 6 samples ready. Save Enrollment, or Cancel.", complete: true, candidate: candidate)
                 }
                 return RecognitionFrameResult(text: instruction)
-            case .verify:
+            case .verify, .evaluate:
                 guard let profile else { throw RecognitionError.noEnrollment }
                 try profile.validate(for: .sface)
                 guard vector.count == ModelIdentity.sface.dimensions else { throw RecognitionError.invalidEmbedding }
                 let score = try Embedding.cosine(profile.embedding, vector)
                 currentScore = score
                 evaluatedFrames += 1
+                if isEvaluation {
+                    let accepted = try evaluation.record(score: score, captureTimestamp: currentFrameTimestamp ?? timestamp, at: evaluationClock?() ?? timestamp)
+                    return RecognitionFrameResult(text: accepted ? "\(evaluation.snapshot(at: timestamp).validCount)/15 quality-approved comparisons. Hold still." : "Waiting for a fresh, sufficiently spaced comparison.")
+                }
                 switch verification.observe(score: score, timestamp: timestamp) {
                 case .checking: return RecognitionFrameResult(text: "Checking — keep facing the camera…")
                 case .match: return RecognitionFrameResult(text: "Inconclusive — three threshold passes observed. Identity acceptance is disabled while the false acceptance is investigated.", complete: true)
@@ -153,6 +210,7 @@ final class RecognitionPipeline {
 
     private func reject(_ text: String) -> RecognitionFrameResult {
         verification.resetStreak()
+        if isEvaluation { evaluation.reject(text, at: processingTime) }
         return RecognitionFrameResult(text: text, rejection: text)
     }
 
